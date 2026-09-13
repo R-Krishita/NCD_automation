@@ -1,0 +1,7 @@
+.venv/
+config.py
+*.xlsx
+data_template.csv
+__pycache__
+
+ncd_automation.zip
