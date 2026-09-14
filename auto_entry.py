@@ -15,6 +15,7 @@ NOTE:
 """
 
 import re
+import os
 import sys
 import time
 
@@ -26,6 +27,7 @@ from selenium.common.exceptions import (
     TimeoutException,
 )
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.select import Select
 from selenium.webdriver.support.ui import WebDriverWait
@@ -40,12 +42,27 @@ import config
 # Excel column name : (selector_type, selector_value)
 # selector_type can be "id", "name", "css", "xpath", or "class"
 FIELD_MAP = {
-    "Name": ("id", "PLACEHOLDER_ID_name"),
-    "Age": ("id", "PLACEHOLDER_ID_age"),
-    "Gender": ("id", "PLACEHOLDER_ID_gender"),
-    "Mobile": ("id", "PLACEHOLDER_ID_mobile"),
+    "District": ("id", "PLACEHOLDER_ID_district"),
+    "Taluka": ("id", "PLACEHOLDER_ID_taluka"),
+    "PHC": ("id", "PLACEHOLDER_ID_phc"),
+    "SHC": ("id", "PLACEHOLDER_ID_shc"),
     "Village": ("id", "PLACEHOLDER_ID_village"),
-    "Aadhar": ("id", "PLACEHOLDER_ID_aadhar"),
+}
+
+LOCATION_FIELDS = ("District", "Taluka", "PHC", "SHC", "Village")
+SECTION_FIELDS = {
+    "Subcenter Information": LOCATION_FIELDS,
+    "Family Information": ("Individual ID", "Family ID", "Family Contact #"),
+    "Fill Individual Details": (
+        "First Name",
+        "Middle Name",
+        "Last Name",
+        "Age",
+        "Sex",
+        "Mobile #",
+        "Address",
+    ),
+    "ID Information": ("ABHA Number",),
 }
 
 # Optional login selectors (fallbacks are auto-generated if placeholders remain)
@@ -62,11 +79,16 @@ SUBMIT_BUTTON_SELECTOR = ("xpath", "//button[contains(text(),'Submit') or contai
 
 
 FIELD_SYNONYMS = {
+    "district": ["district"],
+    "taluka": ["taluka", "block"],
+    "phc": ["phc", "primary health centre", "primary health center"],
+    "shc": ["shc", "sub health centre", "sub health center"],
+    "village": ["village", "hamlet"],
+    "individual": ["individual", "individual id", "number", "id"],
     "name": ["name", "full name", "patient name"],
     "age": ["age"],
     "gender": ["gender", "sex"],
     "mobile": ["mobile", "phone", "contact", "mobile no", "phone number"],
-    "village": ["village"],
     "aadhar": ["aadhar", "aadhaar", "uid"],
 }
 
@@ -174,6 +196,30 @@ def wait_and_click_any(driver, selectors, timeout=15):
     raise TimeoutException(f"No clickable element found for selectors: {selectors}")
 
 
+def dismiss_full_screen_backdrop(driver, timeout=15):
+    """Wait for Angular modal/loading backdrops to disappear."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        visible_backdrops = []
+        for backdrop in driver.find_elements(By.CSS_SELECTOR, ".backdrop.full-screen"):
+            try:
+                if backdrop.is_displayed():
+                    visible_backdrops.append(backdrop)
+            except StaleElementReferenceException:
+                continue
+
+        if not visible_backdrops:
+            return
+
+        try:
+            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+        time.sleep(0.25)
+
+    raise TimeoutException("A full-screen portal backdrop did not disappear")
+
+
 def field_keywords(column_name):
     words = normalize_words(column_name)
     phrases = {" ".join(words), "".join(words), *words}
@@ -191,32 +237,17 @@ def build_smart_field_selectors(column_name):
 
     for keyword in keywords:
         lit = xpath_literal(keyword.lower())
+        contains_attributes = (
+            "placeholder",
+            "aria-label",
+            "formcontrolname",
+        )
         selectors.extend(
             [
                 ("name", keyword),
                 ("id", keyword),
                 ("xpath", f"//*[@name={lit}]"),
                 ("xpath", f"//*[@id={lit}]"),
-                (
-                    "xpath",
-                    f"//*[contains(translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), {lit})]",
-                ),
-                (
-                    "xpath",
-                    f"//*[contains(translate(@id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), {lit})]",
-                ),
-                (
-                    "xpath",
-                    f"//*[contains(translate(@placeholder,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), {lit})]",
-                ),
-                (
-                    "xpath",
-                    f"//*[contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), {lit})]",
-                ),
-                (
-                    "xpath",
-                    f"//*[contains(translate(@formcontrolname,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), {lit})]",
-                ),
                 (
                     "xpath",
                     f"//label[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), {lit})]"
@@ -229,6 +260,27 @@ def build_smart_field_selectors(column_name):
                 ),
             ]
         )
+        if keyword not in ("name", "user", "login"):
+            selectors.extend(
+                [
+                    (
+                        "xpath",
+                        f"//*[contains(translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), {lit})]",
+                    ),
+                    (
+                        "xpath",
+                        f"//*[contains(translate(@id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), {lit})]",
+                    ),
+                ]
+            )
+        if keyword != "name":
+            for attribute in contains_attributes:
+                selectors.append(
+                    (
+                        "xpath",
+                        f"//*[contains(translate(@{attribute},'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), {lit})]",
+                    )
+                )
 
     return dedupe_selectors(selectors)
 
@@ -301,6 +353,27 @@ def build_login_button_selectors():
     return dedupe_selectors([s for s in selectors if not is_placeholder_selector(s)])
 
 
+def build_ncd_login_selectors():
+    return dedupe_selectors(
+        [
+            (
+                "xpath",
+                "//*[self::button or self::a or self::input]"
+                "[contains(translate(normalize-space(.)"
+                ",'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'ncd login')"
+                " or contains(translate(@value"
+                ",'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'ncd login')]",
+            ),
+            (
+                "xpath",
+                "//*[self::button or self::a or self::input]"
+                "[contains(translate(normalize-space(.)"
+                ",'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'ncd')]",
+            ),
+        ]
+    )
+
+
 def build_enrollment_button_selectors():
     selectors = [ENROLLMENT_BUTTON_SELECTOR]
     selectors.extend(
@@ -350,12 +423,20 @@ def build_submit_button_selectors():
 def login(driver):
     print("-> Opening login page...")
     driver.get(config.PORTAL_URL)
-    time.sleep(config.WAIT_TIME)
+    time.sleep(max(config.WAIT_TIME, 2))
 
     username_selectors = build_username_selectors()
     password_selectors = build_password_selectors()
     login_button_selectors = build_login_button_selectors()
 
+    # The portal may first show a landing page with an NCD Login entry point.
+    # Do not click it when the credential form is already present.
+    if find_visible_element(driver, password_selectors[0]) is None:
+        print("-> Opening NCD Login...")
+        wait_and_click_any(driver, build_ncd_login_selectors(), timeout=20)
+        time.sleep(max(config.WAIT_TIME, 2))
+
+    dismiss_full_screen_backdrop(driver)
     user_field = wait_and_find_any(driver, username_selectors, timeout=20)
     user_field.clear()
     user_field.send_keys(config.USERNAME)
@@ -366,8 +447,14 @@ def login(driver):
 
     wait_and_click_any(driver, login_button_selectors, timeout=15)
     time.sleep(max(config.WAIT_TIME, 2))
+    dismiss_full_screen_backdrop(driver)
 
-    still_on_login = find_visible_element(driver, ("xpath", "//input[@type='password']")) is not None
+    still_on_login = any(
+        find_visible_element(driver, selector) is not None
+        for selector in password_selectors
+    ) and find_visible_element(
+        driver, ("xpath", "//*[contains(@id,'enrollment_menu')]")
+    ) is None
     if still_on_login:
         print("[WARN] Password field is still visible after login click.")
         print("       Check credentials, captcha/OTP, or login selectors.")
@@ -377,6 +464,7 @@ def login(driver):
 
 def open_enrollment_form(driver):
     print("-> Opening NCD Enrollment form...")
+    dismiss_full_screen_backdrop(driver)
     wait_and_click_any(driver, build_enrollment_button_selectors(), timeout=20)
     time.sleep(config.WAIT_TIME)
 
@@ -400,50 +488,37 @@ def select_dropdown_value(field, value):
 def wait_for_suggestion_and_select(driver, value, timeout=5):
     """Wait for common suggestion containers and click a matching item."""
     lit = xpath_literal(value.lower())
-    candidate_xpaths = [
-        # common list containers
-        f"//ul[contains(@class,'ui-autocomplete') or contains(@class,'autocomplete') or contains(@class,'suggest')]",
-        f"//div[contains(@class,'select2-results') or contains(@class,'autocomplete-suggestions') or contains(@class,'dropdown-menu')]",
-        f"//div[contains(@class,'suggestion') or contains(@class,'suggestions')]",
-        # items matching the text (case-insensitive)
-        f"//li[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), {lit})]",
-        f"//div[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), {lit})]",
-        f"//a[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), {lit})]",
-        # select2 specific
-        "//li[contains(@class,'select2-results__option')]",
-        "//div[contains(@class,'select2-result-label')]",
-    ]
-
-    # Try to find a matching item by text first
+    option_xpath = (
+        "//*[self::li or self::a or @role='option' or "
+        "contains(@class,'ng-option') or contains(@class,'select2-results__option') or "
+        "contains(@class,'autocomplete-suggestion')]"
+    )
     match_xpaths = [
-        f"//li[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), {lit})]",
-        f"//div[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), {lit})]",
-        f"//a[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), {lit})]",
-        f"//li[normalize-space(.)={lit}]",
-        f"//div[normalize-space(.)={lit}]",
+        f"{option_xpath}[normalize-space(.)={lit}]",
+        f"{option_xpath}[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), {lit})]",
     ]
 
-    selectors = [("xpath", xp) for xp in match_xpaths]
-    try:
-        el = wait_and_find_any(driver, selectors, timeout=timeout)
-        el.click()
-        return True
-    except TimeoutException:
-        pass
+    for xp in match_xpaths:
+        try:
+            el = wait_and_find_any(driver, [("xpath", xp)], timeout=timeout)
+            el.click()
+            return True
+        except TimeoutException:
+            continue
+    return False
 
-    # If exact-match failed, click the first visible suggestion
-    selectors = [("xpath", xp + "//li|" + xp) for xp in candidate_xpaths]
-    # flatten unique xpaths
-    flat = []
-    for xp in selectors:
-        if xp not in flat:
-            flat.append(xp)
-    try:
-        el = wait_and_find_any(driver, flat, timeout=timeout)
-        el.click()
-        return True
-    except TimeoutException:
-        return False
+
+def field_value(field):
+    """Return the value currently displayed by an input or custom widget."""
+    tag = field.tag_name.lower()
+    if tag in ("input", "textarea", "select"):
+        return (field.get_attribute("value") or "").strip()
+    return (field.text or "").strip()
+
+
+def value_was_selected(field, expected):
+    actual = field_value(field)
+    return actual.casefold() == expected.strip().casefold()
 
 
 def handle_autocomplete_input(driver, field, value):
@@ -453,7 +528,7 @@ def handle_autocomplete_input(driver, field, value):
     - click the field
     - send the text (with small pauses)
     - try to pick a suggestion matching text
-    - if no suggestion found, send Enter to accept first suggestion
+    - if no suggestion is clicked, use keyboard selection and verify the value
     """
     try:
         field.click()
@@ -476,11 +551,12 @@ def handle_autocomplete_input(driver, field, value):
     if picked:
         return True
 
-    # fallback: press Enter to accept first suggestion
+    # Keyboard selection is useful for Angular widgets whose option list is
+    # rendered outside the input. It is only accepted when the value remains.
     try:
-        field.send_keys("\n")
+        field.send_keys(Keys.ARROW_DOWN, Keys.ENTER)
         time.sleep(0.3)
-        return True
+        return value_was_selected(field, value)
     except Exception:
         return False
 
@@ -525,79 +601,78 @@ def handle_ng_select_widget(driver, field, value):
 
     # fallback: try pressing Enter on the container
     try:
-        field.send_keys("\n")
+        field.send_keys(Keys.ARROW_DOWN, Keys.ENTER)
         time.sleep(0.2)
-        return True
+        return value_was_selected(field, value)
     except Exception:
         return False
 
 
+def open_information_section(driver, section_name):
+    """Open one of the portal's expandable information sections."""
+    lit = xpath_literal(section_name.lower())
+    selectors = [
+        (
+            "xpath",
+            f"//*[self::button or self::a or @role='button']"
+            f"[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),{lit})]",
+        ),
+        (
+            "xpath",
+            f"//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),{lit})]"
+            f"/ancestor::*[self::button or @role='button' or self::a][1]",
+        ),
+    ]
+    section = wait_and_find_any(driver, selectors, timeout=20)
+    try:
+        section.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", section)
+    time.sleep(0.5)
+
+
+def fill_field(driver, column_name, value):
+    """Locate and fill one field, selecting an option when it is a dropdown."""
+    selectors = resolve_field_selectors(column_name, None)
+    field = wait_and_find_any(driver, selectors, timeout=10)
+    tag = field.tag_name.lower()
+    classes = (field.get_attribute("class") or "").lower()
+
+    if tag == "select":
+        select_dropdown_value(field, value)
+        return
+
+    ng_like = "ng-select" in classes or "ng-value" in classes
+    if ng_like or column_name in LOCATION_FIELDS:
+        if not handle_ng_select_widget(driver, field, value):
+            raise RuntimeError(f"Option '{value}' was not selected for '{column_name}'")
+        return
+
+    target = field
+    if tag not in ("input", "textarea"):
+        target = field.find_element(By.CSS_SELECTOR, "input, textarea")
+    target.clear()
+    target.send_keys(value)
+    time.sleep(0.2)
+
+
 def fill_one_entry(driver, row):
-    """Fill one form entry from a single Excel row."""
-    for column_name, explicit_selector in FIELD_MAP.items():
-        if column_name not in row or pd.isna(row[column_name]):
+    """Open each portal section and fill its corresponding workbook columns."""
+    for section_name, columns in SECTION_FIELDS.items():
+        available = [
+            column
+            for column in columns
+            if column in row and pd.notna(row[column]) and str(row[column]).strip()
+        ]
+        if not available:
             continue
 
-        value = str(row[column_name]).strip()
-        if not value:
-            continue
-
-        selectors = resolve_field_selectors(column_name, explicit_selector)
-        try:
-            field = wait_and_find_any(driver, selectors, timeout=10)
-            tag = field.tag_name.lower()
-            classes = (field.get_attribute('class') or '').lower()
-
-            # Standard <select>
-            if tag == "select":
-                select_dropdown_value(field, value)
-                continue
-
-            # ng-select / custom container detection: common class tokens or id hints
-            ng_like = 'ng-select' in classes or 'ng-value' in classes or 'ng-option' in classes
-            if ng_like or (field.get_attribute('id') or '').lower().startswith('village'):
-                handled = handle_ng_select_widget(driver, field, value)
-                if not handled:
-                    print(f"   [WARN] Could not select value for '{column_name}' in ng-select widget")
-                continue
-
-            # Regular input/textarea
-            if tag in ('input', 'textarea'):
-                try:
-                    field.clear()
-                except Exception:
-                    pass
-                try:
-                    field.send_keys(value)
-                    time.sleep(0.2)
-                except Exception:
-                    pass
-
-                # Some inputs are autocomplete; try to pick a suggestion
-                try:
-                    handle_autocomplete_input(driver, field, value)
-                except Exception:
-                    pass
-                continue
-
-            # As a general fallback, attempt to find an input inside and type
-            try:
-                inner_input = field.find_element(By.CSS_SELECTOR, 'input, textarea')
-                try:
-                    inner_input.clear()
-                except Exception:
-                    pass
-                inner_input.send_keys(value)
-                time.sleep(0.2)
-                try:
-                    handle_autocomplete_input(driver, inner_input, value)
-                except Exception:
-                    pass
-            except Exception:
-                print(f"   [WARN] Could not map field '{column_name}'. Skipped.")
-
-        except (TimeoutException, NoSuchElementException) as e:
-            print(f"   [WARN] Could not map field '{column_name}'. Skipped. ({e})")
+        print(f"   -> Opening {section_name}...")
+        open_information_section(driver, section_name)
+        for column_name in available:
+            value = str(row[column_name]).strip()
+            print(f"      Filling {column_name}")
+            fill_field(driver, column_name, value)
 
     time.sleep(1)
     wait_and_click_any(driver, build_submit_button_selectors(), timeout=20)
@@ -615,6 +690,14 @@ def main():
         print(f"[ERROR] Could not read Excel file: {e}")
         sys.exit(1)
 
+    max_rows = os.environ.get("NCD_MAX_ROWS")
+    if max_rows:
+        try:
+            df = df.head(int(max_rows))
+        except ValueError:
+            print(f"[ERROR] NCD_MAX_ROWS must be an integer, got '{max_rows}'.")
+            sys.exit(1)
+
     print(f"-> Found {len(df)} rows in Excel.")
 
     options = Options()
@@ -630,7 +713,12 @@ def main():
         login(driver)
 
         for idx, row in df.iterrows():
-            print(f"\n-> Filling entry {idx + 1}/{len(df)}: {row.get('Name', '')}")
+            display_name = " ".join(
+                str(row.get(column, "")).strip()
+                for column in ("First Name", "Middle Name", "Last Name")
+                if pd.notna(row.get(column)) and str(row.get(column)).strip()
+            )
+            print(f"\n-> Filling entry {idx + 1}/{len(df)}: {display_name}")
             try:
                 open_enrollment_form(driver)
                 fill_one_entry(driver, row)
@@ -646,7 +734,10 @@ def main():
         print(f"Completed. Success: {success_count} | Fail: {fail_count}")
         print("=" * 55)
         if sys.stdin and sys.stdin.isatty():
-            input("Press Enter to close the browser...")
+            try:
+                input("Press Enter to close the browser...")
+            except EOFError:
+                pass
         driver.quit()
 
 
